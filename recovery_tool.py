@@ -70,10 +70,14 @@ class RecoveryWorker(QThread):
             # 250GB Limit to bypass Windows size check errors
             disk_size = 250 * 1024 * 1024 * 1024 
             
-            self.status_update.emit(f"Scanning (v5.0 Fixed Extraction)...")
+            self.status_update.emit(f"Scanning (v5.0 Complete Scan)...")
 
             offset = 0
             found_count = 0
+            
+            # Overlap buffer to catch files that span chunk boundaries
+            overlap_size = 64 * 1024  # 64KB overlap
+            previous_chunk = b''
             
             while offset < disk_size and self.is_running:
                 if offset % (20 * CHUNK_SIZE) == 0:
@@ -82,33 +86,56 @@ class RecoveryWorker(QThread):
                     self.progress_update.emit(percent)
 
                 try:
-                    data = disk.read(CHUNK_SIZE)
-                    if not data: break
+                    chunk = disk.read(CHUNK_SIZE)
+                    if not chunk: break
+                    
+                    # Combine with previous overlap to catch boundary files
+                    data = previous_chunk + chunk
+                    data_offset = offset - len(previous_chunk)
+                    
                 except:
                     offset += CHUNK_SIZE
                     continue
 
-                # Scan for signatures
+                # Scan for ALL signatures in this chunk
+                signatures_found = []
+                
                 for ext, markers in FILE_MARKERS.items():
                     header = markers['head']
-                    pos = data.find(header)
+                    search_pos = 0
                     
-                    if pos != -1:
-                        global_pos = offset + pos
+                    # Find ALL occurrences of this signature in the chunk
+                    while True:
+                        pos = data.find(header, search_pos)
+                        if pos == -1:
+                            break
+                        
+                        global_pos = data_offset + pos
                         file_start = global_pos
                         
                         # Adjust for MP4 'ftyp' (starts 4 bytes earlier)
-                        if ext == 'mp4': file_start = global_pos - 4
+                        if ext == 'mp4': 
+                            file_start = global_pos - 4
                         
-                        self.status_update.emit(f"Found {ext.upper()} at {file_start}")
+                        signatures_found.append((file_start, ext, markers['foot']))
+                        search_pos = pos + len(header)
+                
+                # Process all found signatures in this chunk
+                for file_start, ext, footer in signatures_found:
+                    if not self.is_running:
+                        break
                         
-                        # --- EXTRACTOR v5.0 FIXED ---
-                        recovered_data, status_msg = self.extract_file(disk, file_start, ext, markers['foot'])
+                    self.status_update.emit(f"Extracting {ext.upper()} at {file_start}")
+                    
+                    # --- EXTRACTOR v5.0 FIXED ---
+                    recovered_data, status_msg = self.extract_file(disk, file_start, ext, footer)
+                    
+                    if recovered_data:
+                        filename = f"recovered_{file_start}.{ext}"
+                        filepath = os.path.join(self.save_dir, filename)
                         
-                        if recovered_data:
-                            filename = f"recovered_{file_start}.{ext}"
-                            filepath = os.path.join(self.save_dir, filename)
-                            
+                        # Check if file already exists (avoid duplicates)
+                        if not os.path.exists(filepath):
                             with open(filepath, 'wb') as f:
                                 f.write(recovered_data)
                             
@@ -120,14 +147,13 @@ class RecoveryWorker(QThread):
                                 'type': ext.upper(),
                                 'status': status_msg
                             })
-                            
-                            # Skip the data we just recovered
-                            if len(recovered_data) > CHUNK_SIZE:
-                                skip = (len(recovered_data) // SECTOR_SIZE) * SECTOR_SIZE
-                                offset += skip
-                                disk.seek(offset)
-                                break 
 
+                # Save overlap for next iteration
+                if len(chunk) >= overlap_size:
+                    previous_chunk = chunk[-overlap_size:]
+                else:
+                    previous_chunk = chunk
+                    
                 offset += CHUNK_SIZE
 
             disk.close()
