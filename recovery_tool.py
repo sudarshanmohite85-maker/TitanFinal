@@ -10,8 +10,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 # -----------------------------------------------------------------------------
-# CONSTANTS & SIGNATURES
+# CONSTANTS & SIGNATURES (VERSION 5.0 - FIXED EXTRACTION)
 # -----------------------------------------------------------------------------
+# We explicitly define Footers for images to prevent corruption
 FILE_MARKERS = {
     'jpg':  {'head': b'\xFF\xD8\xFF', 'foot': b'\xFF\xD9'},
     'png':  {'head': b'\x89\x50\x4E\x47', 'foot': b'\x49\x45\x4E\x44\xAE\x42\x60\x82'},
@@ -19,10 +20,7 @@ FILE_MARKERS = {
     'avi':  {'head': b'\x52\x49\x46\x46', 'foot': None},
 }
 
-# List of all headers to detect "Start of Next File"
-ALL_HEADERS = [m['head'] for m in FILE_MARKERS.values()]
-
-CHUNK_SIZE = 1024 * 1024  # 1 MB read buffer
+CHUNK_SIZE = 1024 * 1024  # 1 MB read speed
 SECTOR_SIZE = 512
 
 # -----------------------------------------------------------------------------
@@ -72,7 +70,7 @@ class RecoveryWorker(QThread):
             # 250GB Limit to bypass Windows size check errors
             disk_size = 250 * 1024 * 1024 * 1024 
             
-            self.status_update.emit(f"Scanning (v7.0 Fixed Alignment)...")
+            self.status_update.emit(f"Scanning (v5.0 Fixed Extraction)...")
 
             offset = 0
             found_count = 0
@@ -99,13 +97,13 @@ class RecoveryWorker(QThread):
                         global_pos = offset + pos
                         file_start = global_pos
                         
-                        # Adjust for MP4 'ftyp' (header starts 4 bytes earlier)
+                        # Adjust for MP4 'ftyp' (starts 4 bytes earlier)
                         if ext == 'mp4': file_start = global_pos - 4
                         
                         self.status_update.emit(f"Found {ext.upper()} at {file_start}")
                         
-                        # --- EXTRACTOR v7.0 ---
-                        recovered_data = self.extract_file(disk, file_start, ext, markers['foot'])
+                        # --- EXTRACTOR v5.0 FIXED ---
+                        recovered_data, status_msg = self.extract_file(disk, file_start, ext, markers['foot'])
                         
                         if recovered_data:
                             filename = f"recovered_{file_start}.{ext}"
@@ -120,14 +118,13 @@ class RecoveryWorker(QThread):
                                 'name': filename,
                                 'size': f"{size_mb:.2f} MB",
                                 'type': ext.upper(),
-                                'status': 'Recovered'
+                                'status': status_msg
                             })
                             
-                            # Align skip to sector boundary to keep Windows happy
-                            skip_len = len(recovered_data)
-                            aligned_skip = (skip_len // SECTOR_SIZE) * SECTOR_SIZE
-                            if aligned_skip > 0:
-                                offset += aligned_skip
+                            # Skip the data we just recovered
+                            if len(recovered_data) > CHUNK_SIZE:
+                                skip = (len(recovered_data) // SECTOR_SIZE) * SECTOR_SIZE
+                                offset += skip
                                 disk.seek(offset)
                                 break 
 
@@ -143,110 +140,151 @@ class RecoveryWorker(QThread):
 
     def extract_file(self, disk, start_pos, ext, footer):
         """
-        v7.0 Extraction Logic (User Corrected):
-        1. Aligns disk read to 512-byte sector.
-        2. Calculates 'diff' (padding).
-        3. Starts footer/next-header search IMMEDIATELY after file signature.
+        v5.0 FIXED Extraction Logic:
+        - Properly handles sector alignment
+        - Extracts clean file data without padding
+        - JPG/PNG: Reads until the exact footer is found
+        - MP4/AVI: Reads until next header or empty space
         """
-        saved = disk.tell()
+        saved_pos = disk.tell()
+        
+        # Align to sector boundary
         aligned = (start_pos // SECTOR_SIZE) * SECTOR_SIZE
-        diff = start_pos - aligned
+        diff = start_pos - aligned  # Offset within the aligned sector
         
         buffer = bytearray()
+        status = "Recovered"
         
         try:
             disk.seek(aligned)
             
-            # Limits: Images 20MB, Videos 3GB
+            # Size limits: Images 20MB, Videos 3GB
             max_limit = 20 * 1024 * 1024 if ext in ['jpg', 'png'] else 3000 * 1024 * 1024
             
-            read_so_far = 0
-            # Initial Read
+            # Initial read
             chunk = disk.read(min(CHUNK_SIZE, max_limit))
+            if not chunk:
+                disk.seek(saved_pos)
+                return (None, "")
+            
             buffer.extend(chunk)
-            read_so_far += len(chunk)
+            read_so_far = len(chunk)
 
-            # --- CORRECTED OFFSET LOGIC ---
-            # We must start scanning immediately after the header.
-            # 'diff' is the junk bytes before our file starts in the buffer.
-            # 'header_len' is the size of the signature we just found.
-            # scan_offset is relative to the start of 'buffer'
+            # Start searching right after the header
             header_len = len(FILE_MARKERS[ext]['head'])
-            
-            # If MP4, we found 'ftyp' at diff+4, so the header effectively covers that range.
-            if ext == 'mp4': header_len += 4
-
             scan_offset = diff + header_len
-            
-            final_size_in_buffer = 0
             found_end = False
+            final_size = 0
             
+            # Main extraction loop
             while read_so_far < max_limit:
                 window = buffer
                 
-                # --- 1. CHECK FOR EXPLICIT FOOTER (JPG/PNG) ---
+                # --- STRATEGY 1: LOOK FOR FOOTER (Images) ---
                 if footer:
                     f_pos = window.find(footer, scan_offset)
                     if f_pos != -1:
-                        final_size_in_buffer = f_pos + len(footer)
+                        # Found the footer! Include it in the file
+                        final_size = f_pos + len(footer)
                         found_end = True
                         break
 
-                # --- 2. CHECK FOR NEXT HEADER (ALL FILES) ---
-                # This is the "Termination Logic" for videos
-                for header in ALL_HEADERS:
-                    h_pos = window.find(header, scan_offset)
-                    if h_pos != -1:
-                        # Found start of NEXT file.
-                        final_size_in_buffer = h_pos
-                        
-                        # Special case: If we hit 'ftyp', the file actually started 4 bytes prior
-                        if header == b'\x66\x74\x79\x70':
-                             final_size_in_buffer -= 4
-                        
-                        found_end = True
+                # --- STRATEGY 2: LOOK FOR NEXT HEADER (Videos) ---
+                if not footer:
+                    # Stop if we encounter another file header
+                    for other_ext, m in FILE_MARKERS.items():
+                        h_pos = window.find(m['head'], scan_offset)
+                        if h_pos != -1:
+                            # Found next file, stop before it
+                            if other_ext == 'mp4':
+                                final_size = h_pos - 4  # MP4 header adjustment
+                            else:
+                                final_size = h_pos
+                            found_end = True
+                            break
+                    if found_end: 
                         break
-                
-                if found_end: break
 
-                # --- 3. CHECK FOR EMPTY SPACE (ZEROS) ---
-                # Check last 4KB for zeros
-                if len(window) > 4096:
-                     tail = window[-4096:]
-                     if tail == b'\x00' * 4096:
-                         final_size_in_buffer = len(window) - 4096
-                         found_end = True
-                         break
+                # --- STRATEGY 3: EMPTY SPACE DETECTION ---
+                if len(window) > scan_offset + 8192:
+                    # Check last 8KB for empty space
+                    tail = window[-8192:]
+                    zero_count = tail.count(b'\x00')
+                    
+                    if zero_count > 7900:  # More than 96% zeros
+                        # Find where zeros start
+                        for i in range(len(window) - 1, scan_offset, -512):
+                            if window[i] != 0:
+                                final_size = i + 1
+                                found_end = True
+                                break
+                        if found_end: 
+                            break
 
-                # Read More
+                # Read more data
                 new_chunk = disk.read(CHUNK_SIZE)
-                if not new_chunk: break
+                if not new_chunk: 
+                    # End of readable data
+                    final_size = len(buffer)
+                    break
+                    
                 buffer.extend(new_chunk)
                 read_so_far += len(new_chunk)
                 
-                # Move scan_offset forward, but keep overlap for split markers
-                scan_offset = len(buffer) - len(new_chunk) - 20 
+                # Update scan offset for next iteration
+                if footer:
+                    # For images with footers, search newly read data
+                    scan_offset = max(scan_offset, len(buffer) - len(new_chunk) - len(footer))
+                else:
+                    # For videos, search newly read data
+                    scan_offset = max(scan_offset, len(buffer) - len(new_chunk) - 100)
 
-            # --- DATA EXTRACTION ---
-            if found_end:
-                # We found a distinct end point
-                valid_data = buffer[diff:final_size_in_buffer]
+            # --- EXTRACT CLEAN FILE DATA ---
+            # Remove the alignment padding at the beginning
+            if found_end and final_size > diff:
+                valid_data = bytes(buffer[diff:final_size])
+            elif not found_end and len(buffer) > diff:
+                valid_data = bytes(buffer[diff:])
             else:
-                # We hit max limit (blind carve)
-                valid_data = buffer[diff:]
+                disk.seek(saved_pos)
+                return (None, "")
+            
+            # --- VALIDATION CHECKS ---
+            # Verify file signature is correct
+            expected_header = FILE_MARKERS[ext]['head']
+            if ext == 'mp4':
+                # MP4 should start with 'ftyp' but we need to check full header
+                if len(valid_data) < 8 or valid_data[4:8] != expected_header:
+                    disk.seek(saved_pos)
+                    return (None, "")
+            else:
+                if not valid_data.startswith(expected_header):
+                    disk.seek(saved_pos)
+                    return (None, "")
+            
+            # Check minimum file sizes
+            if ext in ['jpg', 'png'] and len(valid_data) < 2048:  # 2KB minimum for images
+                disk.seek(saved_pos)
+                return (None, "")
+            
+            if ext in ['mp4', 'avi'] and len(valid_data) < 10240:  # 10KB minimum for videos
+                disk.seek(saved_pos)
+                return (None, "")
+            
+            # Verify footer if expected
+            if footer and found_end:
+                if not valid_data.endswith(footer):
+                    status = "Incomplete"
 
-            # Sanity Check
-            if len(valid_data) < 512: 
-                disk.seek(saved)
-                return None
+            disk.seek(saved_pos)
+            return (valid_data, status)
 
-            disk.seek(saved)
-            return valid_data
-
-        except:
-            try: disk.seek(saved)
-            except: pass
-            return None
+        except Exception as e:
+            try: 
+                disk.seek(saved_pos)
+            except: 
+                pass
+            return (None, "")
 
     def stop(self):
         self.is_running = False
@@ -257,13 +295,31 @@ class RecoveryWorker(QThread):
 class RecoveryApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Titan Recovery - VERSION 7.0 (OFFSET FIXED)")
+        self.setWindowTitle("Titan Recovery v5.0 - FIXED EXTRACTION")
         self.resize(1000, 600)
         self.setStyleSheet("""
             QMainWindow { background-color: #f0f0f0; }
-            QLabel { font-size: 14px; }
-            QTableWidget { background-color: white; }
-            QPushButton { background-color: #0078D7; color: white; padding: 8px; }
+            QLabel { font-size: 14px; font-weight: bold; }
+            QTableWidget { background-color: white; border: 1px solid #ccc; }
+            QPushButton { 
+                background-color: #0078D7; 
+                color: white; 
+                padding: 8px 16px;
+                border: none;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #005fa3; }
+            QPushButton:disabled { background-color: #cccccc; }
+            QComboBox { padding: 6px; border: 1px solid #ccc; }
+            QProgressBar { 
+                border: 1px solid #ccc; 
+                border-radius: 4px; 
+                text-align: center; 
+            }
+            QProgressBar::chunk { 
+                background-color: #0078D7; 
+            }
         """)
         self.worker = None
         self.save_directory = ""
@@ -273,40 +329,74 @@ class RecoveryApp(QMainWindow):
         main = QWidget()
         layout = QVBoxLayout()
         
-        layout.addWidget(QLabel("Titan Recovery v7.0 (Corrected Sector Alignment)"))
+        # Title
+        title = QLabel("🔧 Titan Recovery v5.0 - Fixed Extraction Engine")
+        title.setStyleSheet("font-size: 18px; color: #0078D7; padding: 10px;")
+        layout.addWidget(title)
         
+        # Drive selection
         d_layout = QHBoxLayout()
+        d_layout.addWidget(QLabel("Select Drive:"))
         self.d_combo = QComboBox()
         self.refresh_drives()
-        btn_r = QPushButton("Refresh")
+        btn_r = QPushButton("🔄 Refresh")
         btn_r.clicked.connect(self.refresh_drives)
         d_layout.addWidget(self.d_combo)
         d_layout.addWidget(btn_r)
         layout.addLayout(d_layout)
 
+        # Output folder selection
         o_layout = QHBoxLayout()
-        self.l_out = QLabel("No output folder")
-        btn_o = QPushButton("Select Output")
+        self.l_out = QLabel("No output folder selected")
+        self.l_out.setStyleSheet("color: #666; font-weight: normal;")
+        btn_o = QPushButton("📁 Select Output Folder")
         btn_o.clicked.connect(self.select_output)
         o_layout.addWidget(btn_o)
-        o_layout.addWidget(self.l_out)
+        o_layout.addWidget(self.l_out, 1)
         layout.addLayout(o_layout)
 
-        self.btn_s = QPushButton("Start Scan")
+        # Start button
+        self.btn_s = QPushButton("▶️ Start Recovery Scan")
         self.btn_s.clicked.connect(self.start_scan)
         self.btn_s.setEnabled(False)
+        self.btn_s.setStyleSheet("""
+            QPushButton { 
+                padding: 12px; 
+                font-size: 16px; 
+                background-color: #28a745; 
+            }
+            QPushButton:hover { background-color: #218838; }
+            QPushButton:disabled { background-color: #cccccc; }
+        """)
         layout.addWidget(self.btn_s)
 
+        # Progress bar
         self.p_bar = QProgressBar()
+        self.p_bar.setMinimum(0)
+        self.p_bar.setMaximum(100)
         layout.addWidget(self.p_bar)
-        self.l_stat = QLabel("Ready")
+        
+        # Status label
+        self.l_stat = QLabel("Ready to scan")
+        self.l_stat.setStyleSheet("color: #28a745; font-weight: normal; padding: 5px;")
         layout.addWidget(self.l_stat)
 
+        # Results table
+        table_label = QLabel("Recovered Files:")
+        layout.addWidget(table_label)
+        
         self.table = QTableWidget()
         self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Name", "Size", "Type", "Status"])
+        self.table.setHorizontalHeaderLabels(["Filename", "Size", "Type", "Status"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         layout.addWidget(self.table)
+
+        # Info footer
+        info = QLabel("💡 This tool recovers deleted files by scanning raw disk sectors. Run as Administrator!")
+        info.setStyleSheet("color: #666; font-size: 12px; font-weight: normal; padding: 10px;")
+        layout.addWidget(info)
 
         main.setLayout(layout)
         self.setCentralWidget(main)
@@ -316,15 +406,18 @@ class RecoveryApp(QMainWindow):
         drives = get_drives()
         if drives:
             self.d_combo.setEnabled(True)
-            for l, p in drives: self.d_combo.addItem(f"Drive {l}", p)
+            for l, p in drives: 
+                self.d_combo.addItem(f"Drive {l}: ({p})", p)
         else:
             self.d_combo.setEnabled(False)
+            self.d_combo.addItem("No drives found")
 
     def select_output(self):
-        f = QFileDialog.getExistingDirectory(self, "Select Output")
-        if f:
-            self.save_directory = f
-            self.l_out.setText(f)
+        folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        if folder:
+            self.save_directory = folder
+            self.l_out.setText(folder)
+            self.l_out.setStyleSheet("color: #28a745; font-weight: normal;")
             self.check_ready()
 
     def check_ready(self):
@@ -334,11 +427,15 @@ class RecoveryApp(QMainWindow):
     def start_scan(self):
         path = self.d_combo.currentData()
         self.btn_s.setEnabled(False)
+        self.table.setRowCount(0)
+        self.p_bar.setValue(0)
+        
         self.worker = RecoveryWorker(path, self.save_directory)
         self.worker.progress_update.connect(self.p_bar.setValue)
         self.worker.status_update.connect(self.l_stat.setText)
         self.worker.file_found.connect(self.add_row)
-        self.worker.finished_scan.connect(lambda: self.btn_s.setEnabled(True))
+        self.worker.error_occurred.connect(self.show_error)
+        self.worker.finished_scan.connect(self.scan_finished)
         self.worker.start()
 
     def add_row(self, data):
@@ -347,10 +444,30 @@ class RecoveryApp(QMainWindow):
         self.table.setItem(r, 0, QTableWidgetItem(data['name']))
         self.table.setItem(r, 1, QTableWidgetItem(data['size']))
         self.table.setItem(r, 2, QTableWidgetItem(data['type']))
-        self.table.setItem(r, 3, QTableWidgetItem(data['status']))
+        
+        status_item = QTableWidgetItem(data['status'])
+        if data['status'] == "Recovered":
+            status_item.setForeground(Qt.GlobalColor.darkGreen)
+        else:
+            status_item.setForeground(Qt.GlobalColor.darkYellow)
+        self.table.setItem(r, 3, status_item)
+        
+        self.table.scrollToBottom()
+
+    def scan_finished(self):
+        self.btn_s.setEnabled(True)
+        QMessageBox.information(self, "Scan Complete", 
+                                f"Recovery scan finished!\n\n"
+                                f"Files recovered: {self.table.rowCount()}\n"
+                                f"Saved to: {self.save_directory}")
+
+    def show_error(self, error_msg):
+        self.btn_s.setEnabled(True)
+        QMessageBox.critical(self, "Error", f"An error occurred:\n\n{error_msg}")
 
 if __name__ == "__main__":
     if not is_admin():
+        # Request admin privileges
         ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
     else:
         app = QApplication(sys.argv)
