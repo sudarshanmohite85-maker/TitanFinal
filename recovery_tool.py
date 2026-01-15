@@ -10,9 +10,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 # -----------------------------------------------------------------------------
-# CONSTANTS & SIGNATURES (VERSION 5.0 - EXACT MATCH)
+# CONSTANTS & SIGNATURES
 # -----------------------------------------------------------------------------
-# We explicitly define Footers for images to prevent corruption
 FILE_MARKERS = {
     'jpg':  {'head': b'\xFF\xD8\xFF', 'foot': b'\xFF\xD9'},
     'png':  {'head': b'\x89\x50\x4E\x47', 'foot': b'\x49\x45\x4E\x44\xAE\x42\x60\x82'},
@@ -20,7 +19,10 @@ FILE_MARKERS = {
     'avi':  {'head': b'\x52\x49\x46\x46', 'foot': None},
 }
 
-CHUNK_SIZE = 1024 * 1024  # 1 MB read speed
+# List of all headers to detect "Start of Next File"
+ALL_HEADERS = [m['head'] for m in FILE_MARKERS.values()]
+
+CHUNK_SIZE = 1024 * 1024  # 1 MB read buffer
 SECTOR_SIZE = 512
 
 # -----------------------------------------------------------------------------
@@ -70,7 +72,7 @@ class RecoveryWorker(QThread):
             # 250GB Limit to bypass Windows size check errors
             disk_size = 250 * 1024 * 1024 * 1024 
             
-            self.status_update.emit(f"Scanning (v5.0 Exact-Match Logic)...")
+            self.status_update.emit(f"Scanning (v7.0 Fixed Alignment)...")
 
             offset = 0
             found_count = 0
@@ -97,13 +99,13 @@ class RecoveryWorker(QThread):
                         global_pos = offset + pos
                         file_start = global_pos
                         
-                        # Adjust for MP4 'ftyp' (starts 4 bytes earlier)
+                        # Adjust for MP4 'ftyp' (header starts 4 bytes earlier)
                         if ext == 'mp4': file_start = global_pos - 4
                         
                         self.status_update.emit(f"Found {ext.upper()} at {file_start}")
                         
-                        # --- EXTRACTOR v5.0 ---
-                        recovered_data, status_msg = self.extract_file(disk, file_start, ext, markers['foot'])
+                        # --- EXTRACTOR v7.0 ---
+                        recovered_data = self.extract_file(disk, file_start, ext, markers['foot'])
                         
                         if recovered_data:
                             filename = f"recovered_{file_start}.{ext}"
@@ -118,13 +120,14 @@ class RecoveryWorker(QThread):
                                 'name': filename,
                                 'size': f"{size_mb:.2f} MB",
                                 'type': ext.upper(),
-                                'status': status_msg
+                                'status': 'Recovered'
                             })
                             
-                            # Skip the data we just recovered
-                            if len(recovered_data) > CHUNK_SIZE:
-                                skip = (len(recovered_data) // SECTOR_SIZE) * SECTOR_SIZE
-                                offset += skip
+                            # Align skip to sector boundary to keep Windows happy
+                            skip_len = len(recovered_data)
+                            aligned_skip = (skip_len // SECTOR_SIZE) * SECTOR_SIZE
+                            if aligned_skip > 0:
+                                offset += aligned_skip
                                 disk.seek(offset)
                                 break 
 
@@ -140,16 +143,16 @@ class RecoveryWorker(QThread):
 
     def extract_file(self, disk, start_pos, ext, footer):
         """
-        v5.0 Extraction Logic:
-        - JPG/PNG: Reads until the exact footer is found. NO JUNK DATA.
-        - MP4: Reads until next 'ftyp' header or empty space.
+        v7.0 Extraction Logic (User Corrected):
+        1. Aligns disk read to 512-byte sector.
+        2. Calculates 'diff' (padding).
+        3. Starts footer/next-header search IMMEDIATELY after file signature.
         """
         saved = disk.tell()
         aligned = (start_pos // SECTOR_SIZE) * SECTOR_SIZE
         diff = start_pos - aligned
         
         buffer = bytearray()
-        status = "Recovered"
         
         try:
             disk.seek(aligned)
@@ -163,44 +166,55 @@ class RecoveryWorker(QThread):
             buffer.extend(chunk)
             read_so_far += len(chunk)
 
-            scan_offset = diff + 16 
+            # --- CORRECTED OFFSET LOGIC ---
+            # We must start scanning immediately after the header.
+            # 'diff' is the junk bytes before our file starts in the buffer.
+            # 'header_len' is the size of the signature we just found.
+            # scan_offset is relative to the start of 'buffer'
+            header_len = len(FILE_MARKERS[ext]['head'])
+            
+            # If MP4, we found 'ftyp' at diff+4, so the header effectively covers that range.
+            if ext == 'mp4': header_len += 4
+
+            scan_offset = diff + header_len
+            
+            final_size_in_buffer = 0
             found_end = False
-            final_size = 0
             
             while read_so_far < max_limit:
                 window = buffer
                 
-                # --- STRATEGY 1: LOOK FOR FOOTER (Images) ---
+                # --- 1. CHECK FOR EXPLICIT FOOTER (JPG/PNG) ---
                 if footer:
-                    # Search for footer starting from where we last looked
                     f_pos = window.find(footer, scan_offset)
                     if f_pos != -1:
-                        final_size = f_pos + len(footer)
-                        buffer = buffer[:final_size]
+                        final_size_in_buffer = f_pos + len(footer)
                         found_end = True
                         break
 
-                # --- STRATEGY 2: LOOK FOR NEXT HEADER (Videos) ---
-                if not footer:
-                    # Stop if we see another MP4 or JPG start
-                    for other_ext, m in FILE_MARKERS.items():
-                        h_pos = window.find(m['head'], scan_offset)
-                        if h_pos != -1:
-                            final_size = h_pos
-                            # MP4 special adjustment
-                            if other_ext == 'mp4': final_size -= 4
-                            
-                            buffer = buffer[:final_size]
-                            found_end = True
-                            break
-                    if found_end: break
+                # --- 2. CHECK FOR NEXT HEADER (ALL FILES) ---
+                # This is the "Termination Logic" for videos
+                for header in ALL_HEADERS:
+                    h_pos = window.find(header, scan_offset)
+                    if h_pos != -1:
+                        # Found start of NEXT file.
+                        final_size_in_buffer = h_pos
+                        
+                        # Special case: If we hit 'ftyp', the file actually started 4 bytes prior
+                        if header == b'\x66\x74\x79\x70':
+                             final_size_in_buffer -= 4
+                        
+                        found_end = True
+                        break
+                
+                if found_end: break
 
-                # --- STRATEGY 3: EMPTY SPACE CHECK ---
+                # --- 3. CHECK FOR EMPTY SPACE (ZEROS) ---
+                # Check last 4KB for zeros
                 if len(window) > 4096:
                      tail = window[-4096:]
                      if tail == b'\x00' * 4096:
-                         # Trim zeros
-                         buffer = buffer[:len(window) - 4096]
+                         final_size_in_buffer = len(window) - 4096
                          found_end = True
                          break
 
@@ -210,25 +224,29 @@ class RecoveryWorker(QThread):
                 buffer.extend(new_chunk)
                 read_so_far += len(new_chunk)
                 
-                if footer:
-                    scan_offset = len(buffer) - len(new_chunk) - len(footer)
-                else:
-                    scan_offset = len(buffer) - len(new_chunk) - 100
+                # Move scan_offset forward, but keep overlap for split markers
+                scan_offset = len(buffer) - len(new_chunk) - 20 
 
-            # --- VALIDATION ---
-            valid_data = buffer[diff:]
-            
-            # Final Check: If image is too small, it's junk
-            if ext in ['jpg', 'png'] and len(valid_data) < 1024:
-                return (None, "")
+            # --- DATA EXTRACTION ---
+            if found_end:
+                # We found a distinct end point
+                valid_data = buffer[diff:final_size_in_buffer]
+            else:
+                # We hit max limit (blind carve)
+                valid_data = buffer[diff:]
+
+            # Sanity Check
+            if len(valid_data) < 512: 
+                disk.seek(saved)
+                return None
 
             disk.seek(saved)
-            return (valid_data, status) if len(valid_data) > 0 else (None, "")
+            return valid_data
 
         except:
             try: disk.seek(saved)
             except: pass
-            return (None, "")
+            return None
 
     def stop(self):
         self.is_running = False
@@ -239,8 +257,7 @@ class RecoveryWorker(QThread):
 class RecoveryApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        # VERIFY THIS TITLE
-        self.setWindowTitle("Titan Recovery - FINAL VERSION 5.0")
+        self.setWindowTitle("Titan Recovery - VERSION 7.0 (OFFSET FIXED)")
         self.resize(1000, 600)
         self.setStyleSheet("""
             QMainWindow { background-color: #f0f0f0; }
@@ -256,7 +273,7 @@ class RecoveryApp(QMainWindow):
         main = QWidget()
         layout = QVBoxLayout()
         
-        layout.addWidget(QLabel("Titan Recovery v5.0 (Header-Footer Lock)"))
+        layout.addWidget(QLabel("Titan Recovery v7.0 (Corrected Sector Alignment)"))
         
         d_layout = QHBoxLayout()
         self.d_combo = QComboBox()
